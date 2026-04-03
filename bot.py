@@ -8,6 +8,8 @@ from email.utils import parsedate_to_datetime
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler
 
 load_dotenv()
 
@@ -345,85 +347,147 @@ def place_sell(token_id, size):
     return get_client().post_order(signed_order, OrderType.GTC)
 
 
-def check_exits():
-    for token_id, position in list(active_positions.items()):
-        bid, _ = get_orderbook(token_id)
-        if bid is None:
-            continue
+# Pending bet waiting for user confirmation: { opportunity dict } or None
+_pending_bet = None
 
+CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+
+
+def _format_signal(op):
+    side = op["side"]
+    price = op["yes_price"] if side == "YES" else round(1 - op["yes_price"], 4)
+    drift = op.get("drift_short")
+    drift_str = f"{drift:+.1f}%" if drift else "n/a"
+    lines = [
+        f"[{op['score']}pts] [{side}] {op['question'][:70]}",
+        f"Price: {price:.3f} | Vol: ${op['volume']:,.0f} | Drift: {drift_str}",
+        f"Consistency: {op['consistency']:.0%} | {', '.join(op['reasons'])}",
+    ]
+    if op.get("news"):
+        lines.append(f"NEWS ({op['news_age']}min ago): {op['news'][:90]}")
+    return "\n".join(lines)
+
+
+async def check_exits_notify(context):
+    for token_id, position in list(active_positions.items()):
+        # Use latest price from price_history (Gamma API data)
+        history = price_history.get(token_id, [])
+        if not history:
+            continue
+        current_price = history[-1]["price"]
         entry = position["entry_price"]
-        pnl_pct = (bid - entry) / entry * 100
+        pnl_pct = (current_price - entry) / entry * 100
         label = position["question"][:50]
 
         if pnl_pct >= 40:
-            print(f"  TAKE PROFIT: {label} +{pnl_pct:.1f}%")
             place_sell(token_id, position["size"])
             del active_positions[token_id]
-
+            await context.bot.send_message(
+                CHAT_ID, f"TAKE PROFIT: {label}\n+{pnl_pct:.1f}%"
+            )
         elif pnl_pct <= -30:
-            print(f"  STOP LOSS:   {label} {pnl_pct:.1f}%")
             place_sell(token_id, position["size"])
             del active_positions[token_id]
+            await context.bot.send_message(
+                CHAT_ID, f"STOP LOSS: {label}\n{pnl_pct:.1f}%"
+            )
 
 
-def run_bot():
-    print("Polymarket bot started.")
-    print("Building price history — first signals in ~5 minutes...\n")
+async def bot_cycle(context):
+    global _pending_bet
+    try:
+        markets = get_markets()
+        track_prices(markets)
 
-    cycle = 0
+        if active_positions:
+            await check_exits_notify(context)
 
-    while True:
-        cycle += 1
-        print(f"--- Cycle {cycle} | {datetime.now().strftime('%H:%M:%S')} ---")
+        opportunities = find_opportunities()
+        if not opportunities:
+            return
 
+        best = opportunities[0]
+        if best["score"] >= 4 and _pending_bet is None:
+            _pending_bet = best
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Bet $2", callback_data="bet_yes"),
+                InlineKeyboardButton("Skip", callback_data="bet_no"),
+            ]])
+            await context.bot.send_message(
+                CHAT_ID,
+                _format_signal(best),
+                reply_markup=keyboard,
+            )
+    except Exception as e:
+        await context.bot.send_message(CHAT_ID, f"Error: {e}")
+
+
+async def button_handler(update, context):
+    global _pending_bet
+    query = update.callback_query
+    await query.answer()
+
+    if query.effective_chat.id != CHAT_ID:
+        return
+
+    if query.data == "bet_yes" and _pending_bet:
+        op = _pending_bet
+        side = op["side"]
+        bet_price = op["yes_price"] if side == "YES" else round(1 - op["yes_price"], 4)
         try:
-            markets = get_markets()
-            track_prices(markets)
-
-            if active_positions:
-                print(f"Open positions: {len(active_positions)}")
-                check_exits()
-
-            opportunities = find_opportunities()
-
-            if not opportunities:
-                print("No opportunities yet.")
-            else:
-                print(f"\nTop opportunities:")
-                for op in opportunities[:5]:
-                    side = op["side"]
-                    price = op["yes_price"] if side == "YES" else round(1 - op["yes_price"], 4)
-                    drift_s = op["drift_short"]
-                    drift_l = op["drift_long"]
-                    drift_str = f"{drift_s:+.1f}%" if drift_s else "n/a"
-                    if drift_l:
-                        drift_str += f" (10-period: {drift_l:+.1f}%)"
-                    print(f"\n  [{op['score']}pts] [{side}] {op['question'][:60]}")
-                    print(f"  Price: {price:.3f} | Volume: ${op['volume']:,.0f} | Drift: {drift_str}")
-                    print(f"  Consistency: {op['consistency']:.0%} up | Reasons: {', '.join(op['reasons'])}")
-                    if op.get("news"):
-                        print(f"  NEWS ({op['news_age']}min ago): {op['news'][:80]}")
-
-                best = opportunities[0]
-                if best["score"] >= 4:
-                    side = best["side"]
-                    bet_price = best["yes_price"] if side == "YES" else round(1 - best["yes_price"], 4)
-                    confirm = input(f"\nBet $2 {side} on top pick? (y/n): ")
-                    if confirm.strip().lower() == "y":
-                        result = place_bet(best["token_id"], bet_price)
-                        active_positions[best["token_id"]] = {
-                            "entry_price": bet_price,
-                            "size": round(2.0 / bet_price, 2),
-                            "question": best["question"],
-                        }
-                        print(f"  Order placed: {result}")
-
+            place_bet(op["token_id"], bet_price)
+            active_positions[op["token_id"]] = {
+                "entry_price": bet_price,
+                "size": round(2.0 / bet_price, 2),
+                "question": op["question"],
+            }
+            await query.edit_message_text(
+                f"Bet placed! [{side}] {op['question'][:60]}\nPrice: {bet_price:.3f}"
+            )
         except Exception as e:
-            print(f"Error: {e}")
+            await query.edit_message_text(f"Order failed: {e}")
+        _pending_bet = None
 
-        print(f"\nNext scan in 60s...")
-        time.sleep(60)
+    elif query.data == "bet_no":
+        label = _pending_bet["question"][:60] if _pending_bet else "?"
+        await query.edit_message_text(f"Skipped: {label}")
+        _pending_bet = None
+
+
+async def cmd_start(update, context):
+    if update.effective_chat.id != CHAT_ID:
+        return
+    await update.message.reply_text(
+        "Polymarket bot running. I'll ping you when I find a signal (score >= 4).\n"
+        "Commands: /status"
+    )
+
+
+async def cmd_status(update, context):
+    if update.effective_chat.id != CHAT_ID:
+        return
+    if not active_positions:
+        await update.message.reply_text("No open positions.")
+        return
+    lines = [f"Open positions ({len(active_positions)}):"]
+    for pos in active_positions.values():
+        lines.append(f"  {pos['question'][:45]} @ {pos['entry_price']:.3f}")
+    await update.message.reply_text("\n".join(lines))
 
 
 if __name__ == "__main__":
-    run_bot()
+    token = os.getenv("TELEGRAM_TOKEN")
+    if not token:
+        raise SystemExit("TELEGRAM_TOKEN not set in .env")
+    if not CHAT_ID:
+        raise SystemExit("TELEGRAM_CHAT_ID not set in .env")
+
+    print("Polymarket Telegram bot starting...")
+    print("Building price history — first signals in ~5 minutes.\n")
+
+    app = ApplicationBuilder().token(token).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.job_queue.run_repeating(bot_cycle, interval=60, first=10)
+    app.run_polling()
