@@ -3,7 +3,7 @@ import json
 import time
 import requests
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
 from email.utils import parsedate_to_datetime
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
@@ -28,8 +28,29 @@ def get_client():
 
 # Price history: { token_id: [ {price, time, question, volume}, ... ] }
 price_history = {}
-# Open positions: { token_id: { entry_price, size, question } }
+# Open positions: { token_id: { entry_price, size, question, side } }
 active_positions = {}
+# Closed trades log: [ { question, side, entry_price, exit_price, size, pnl_usdc, pnl_pct, closed_at } ]
+closed_trades = []
+
+# --- Bet sizing ---
+BANKROLL = 100.0   # assumed USDC bankroll for Kelly calculation
+MAX_BET  = 20.0    # hard cap per trade
+MIN_BET  = 1.0
+
+# Score → estimated edge over market price
+_SCORE_EDGE = {3: 0.03, 4: 0.06, 5: 0.10, 6: 0.15, 7: 0.20}
+
+
+def kelly_bet_size(price: float, score: int) -> float:
+    """Half-Kelly bet size in USDC, clamped to [MIN_BET, MAX_BET]."""
+    edge = _SCORE_EDGE.get(min(score, 7), 0.20)
+    our_p = min(price + edge, 0.97)
+    b = (1 - price) / price          # net odds (win/lose)
+    kelly_f = (b * our_p - (1 - our_p)) / b
+    kelly_f = max(0.0, kelly_f)
+    bet = 0.5 * kelly_f * BANKROLL   # half-Kelly for safety
+    return round(max(MIN_BET, min(MAX_BET, bet)), 2)
 
 
 def get_markets():
@@ -128,6 +149,21 @@ def compute_signals(token_id):
         "consistency": consistency,
         "spread": history[-1].get("spread"),
     }
+
+
+def volume_spike(token_id: str) -> bool:
+    """True if the latest volume delta is ≥2× the recent average delta."""
+    history = price_history.get(token_id, [])
+    if len(history) < 4:
+        return False
+    vols = [h["volume"] for h in history]
+    deltas = [vols[i] - vols[i - 1] for i in range(1, len(vols))]
+    if deltas[-1] <= 0:
+        return False
+    avg_prev = sum(deltas[:-1]) / len(deltas[:-1]) if len(deltas) > 1 else 0
+    if avg_prev <= 0:
+        return False
+    return deltas[-1] >= avg_prev * 2
 
 
 _news_cache = {}  # { query: { "articles": [...], "fetched_at": datetime } }
@@ -257,7 +293,12 @@ def find_opportunities():
                 score_yes += 1
                 reasons_yes.append(f"Recent news ({news_age}min ago)")
 
+        if volume_spike(token_id):
+            score_yes += 2
+            reasons_yes.append("Volume spike (2x avg)")
+
         if score_yes >= 3:
+            bet = kelly_bet_size(yes_price, score_yes)
             results.append({
                 "token_id": token_id,
                 "question": question,
@@ -271,6 +312,7 @@ def find_opportunities():
                 "side": "YES",
                 "news": news_headline,
                 "news_age": news_age,
+                "bet_size": bet,
             })
 
         # --- NO signal ---
@@ -308,7 +350,13 @@ def find_opportunities():
                     score_no += 1
                     reasons_no.append(f"Recent news ({news_age}min ago)")
 
+            if volume_spike(token_id):
+                score_no += 2
+                reasons_no.append("Volume spike (2x avg)")
+
             if score_no >= 3 and no_token_id:
+                no_price = round(1 - yes_price, 4)
+                bet = kelly_bet_size(no_price, score_no)
                 results.append({
                     "token_id": no_token_id,
                     "question": question,
@@ -322,12 +370,13 @@ def find_opportunities():
                     "side": "NO",
                     "news": news_headline,
                     "news_age": news_age,
+                    "bet_size": bet,
                 })
 
     return sorted(results, key=lambda x: x["score"], reverse=True)
 
 
-def place_bet(token_id, price, usdc_amount=2.0):
+def place_bet(token_id, price, usdc_amount=MIN_BET):
     size = round(usdc_amount / price, 2)
     order_args = OrderArgs(
         token_id=token_id,
@@ -356,6 +405,8 @@ def place_sell(token_id, size):
 
 # Pending bet waiting for user confirmation: { opportunity dict } or None
 _pending_bet = None
+# Pending sell confirmations: { token_id: { position, current_price, reason, pnl_pct } }
+_pending_sells = {}
 
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 
@@ -365,19 +416,37 @@ def _format_signal(op):
     price = op["yes_price"] if side == "YES" else round(1 - op["yes_price"], 4)
     drift = op.get("drift_short")
     drift_str = f"{drift:+.1f}%" if drift else "n/a"
+    bet = op.get("bet_size", MIN_BET)
     lines = [
         f"[{op['score']}pts] [{side}] {op['question'][:70]}",
         f"Price: {price:.3f} | Vol: ${op['volume']:,.0f} | Drift: {drift_str}",
         f"Consistency: {op['consistency']:.0%} | {', '.join(op['reasons'])}",
+        f"Kelly bet: ${bet:.2f}",
     ]
     if op.get("news"):
         lines.append(f"NEWS ({op['news_age']}min ago): {op['news'][:90]}")
     return "\n".join(lines)
 
 
+def _record_closed_trade(position, exit_price):
+    entry = position["entry_price"]
+    size = position["size"]
+    pnl_usdc = (exit_price - entry) * size
+    pnl_pct = (exit_price - entry) / entry * 100
+    closed_trades.append({
+        "question": position["question"],
+        "side": position.get("side", "YES"),
+        "entry_price": entry,
+        "exit_price": exit_price,
+        "size": size,
+        "pnl_usdc": round(pnl_usdc, 4),
+        "pnl_pct": round(pnl_pct, 2),
+        "closed_at": datetime.now().isoformat(),
+    })
+
+
 async def check_exits_notify(context):
     for token_id, position in list(active_positions.items()):
-        # Use latest price from price_history (Gamma API data)
         history = price_history.get(token_id, [])
         if not history:
             continue
@@ -386,17 +455,31 @@ async def check_exits_notify(context):
         pnl_pct = (current_price - entry) / entry * 100
         label = position["question"][:50]
 
+        if token_id in _pending_sells:
+            continue  # already waiting for confirmation
+
+        reason = None
         if pnl_pct >= 40:
-            place_sell(token_id, position["size"])
-            del active_positions[token_id]
-            await context.bot.send_message(
-                CHAT_ID, f"TAKE PROFIT: {label}\n+{pnl_pct:.1f}%"
-            )
+            reason = f"TAKE PROFIT +{pnl_pct:.1f}%"
         elif pnl_pct <= -30:
-            place_sell(token_id, position["size"])
-            del active_positions[token_id]
+            reason = f"STOP LOSS {pnl_pct:.1f}%"
+
+        if reason:
+            _pending_sells[token_id] = {
+                "position": position,
+                "current_price": current_price,
+                "pnl_pct": pnl_pct,
+                "reason": reason,
+            }
+            sign = "+" if pnl_pct >= 0 else ""
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Sell now", callback_data=f"sell_confirm_{token_id}"),
+                InlineKeyboardButton("Hold", callback_data=f"sell_hold_{token_id}"),
+            ]])
             await context.bot.send_message(
-                CHAT_ID, f"STOP LOSS: {label}\n{pnl_pct:.1f}%"
+                CHAT_ID,
+                f"{reason}\n{label}\nEntry: {entry:.3f} → Now: {current_price:.3f}  ({sign}{pnl_pct:.1f}%)",
+                reply_markup=keyboard,
             )
 
 
@@ -416,8 +499,9 @@ async def bot_cycle(context):
         best = opportunities[0]
         if best["score"] >= 4 and _pending_bet is None:
             _pending_bet = best
+            bet_label = f"Bet ${best.get('bet_size', MIN_BET):.2f}"
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("Bet $2", callback_data="bet_yes"),
+                InlineKeyboardButton(bet_label, callback_data="bet_yes"),
                 InlineKeyboardButton("Skip", callback_data="bet_no"),
             ]])
             await context.bot.send_message(
@@ -441,15 +525,18 @@ async def button_handler(update, context):
         op = _pending_bet
         side = op["side"]
         bet_price = op["yes_price"] if side == "YES" else round(1 - op["yes_price"], 4)
+        bet_usdc = op.get("bet_size", MIN_BET)
         try:
-            place_bet(op["token_id"], bet_price)
+            place_bet(op["token_id"], bet_price, bet_usdc)
             active_positions[op["token_id"]] = {
                 "entry_price": bet_price,
-                "size": round(2.0 / bet_price, 2),
+                "size": round(bet_usdc / bet_price, 2),
                 "question": op["question"],
+                "side": op["side"],
             }
             await query.edit_message_text(
-                f"Bet placed! [{side}] {op['question'][:60]}\nPrice: {bet_price:.3f}"
+                f"Bet placed! [{side}] {op['question'][:60]}\n"
+                f"Price: {bet_price:.3f} | Amount: ${bet_usdc:.2f}"
             )
         except Exception as e:
             await query.edit_message_text(f"Order failed: {e}")
@@ -460,13 +547,75 @@ async def button_handler(update, context):
         await query.edit_message_text(f"Skipped: {label}")
         _pending_bet = None
 
+    elif query.data.startswith("sell_confirm_"):
+        token_id = query.data[len("sell_confirm_"):]
+        pending = _pending_sells.pop(token_id, None)
+        if pending:
+            pos = pending["position"]
+            exit_price = pending["current_price"]
+            try:
+                place_sell(token_id, pos["size"])
+                _record_closed_trade(pos, exit_price)
+                del active_positions[token_id]
+                sign = "+" if pending["pnl_pct"] >= 0 else ""
+                await query.edit_message_text(
+                    f"Sold! {pos['question'][:55]}\n"
+                    f"{sign}{pending['pnl_pct']:.1f}% | Exit: {exit_price:.3f}"
+                )
+            except Exception as e:
+                await query.edit_message_text(f"Sell failed: {e}")
+        else:
+            await query.edit_message_text("Position no longer found.")
+
+    elif query.data.startswith("sell_hold_"):
+        token_id = query.data[len("sell_hold_"):]
+        pending = _pending_sells.pop(token_id, None)
+        if pending:
+            await query.edit_message_text(
+                f"Holding: {pending['position']['question'][:60]}"
+            )
+
+
+def _pnl_summary_text(trades, label="Today"):
+    if not trades:
+        return f"{label}'s P&L: no closed trades."
+    total_pnl = sum(t["pnl_usdc"] for t in trades)
+    wins = [t for t in trades if t["pnl_usdc"] > 0]
+    losses = [t for t in trades if t["pnl_usdc"] <= 0]
+    lines = [
+        f"{label}'s P&L: {'+' if total_pnl >= 0 else ''}{total_pnl:.2f} USDC "
+        f"({len(wins)}W / {len(losses)}L)",
+    ]
+    for t in trades:
+        sign = "+" if t["pnl_usdc"] >= 0 else ""
+        lines.append(
+            f"  [{t['side']}] {t['question'][:45]}\n"
+            f"    {t['entry_price']:.3f} -> {t['exit_price']:.3f}  "
+            f"{sign}{t['pnl_usdc']:.2f} USDC ({sign}{t['pnl_pct']:.1f}%)"
+        )
+    return "\n".join(lines)
+
+
+async def daily_pnl_summary(context):
+    today = datetime.now().date().isoformat()
+    todays_trades = [t for t in closed_trades if t["closed_at"].startswith(today)]
+    await context.bot.send_message(CHAT_ID, _pnl_summary_text(todays_trades))
+
+
+async def cmd_pnl(update, context):
+    if update.effective_chat.id != CHAT_ID:
+        return
+    today = datetime.now().date().isoformat()
+    todays_trades = [t for t in closed_trades if t["closed_at"].startswith(today)]
+    await update.message.reply_text(_pnl_summary_text(todays_trades))
+
 
 async def cmd_start(update, context):
     if update.effective_chat.id != CHAT_ID:
         return
     await update.message.reply_text(
         "Polymarket bot running. I'll ping you when I find a signal (score >= 4).\n"
-        "Commands: /status"
+        "Commands: /status | /pnl"
     )
 
 
@@ -495,6 +644,8 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("pnl", cmd_pnl))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.job_queue.run_repeating(bot_cycle, interval=60, first=10)
+    app.job_queue.run_daily(daily_pnl_summary, time=dtime(23, 59, tzinfo=timezone.utc))
     app.run_polling()
