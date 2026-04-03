@@ -2,7 +2,9 @@ import os
 import json
 import time
 import requests
-from datetime import datetime
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
@@ -119,6 +121,66 @@ def compute_signals(token_id):
     }
 
 
+_news_cache = {}  # { query: { "articles": [...], "fetched_at": datetime } }
+_NEWS_TTL = 300   # seconds — refresh every 5 minutes
+_STOP_WORDS = {
+    "will", "the", "a", "an", "in", "on", "at", "to", "for", "of", "is",
+    "be", "by", "or", "and", "any", "all", "from", "than", "that", "this",
+    "with", "before", "after", "who", "what", "when", "where", "how",
+    "does", "did", "do", "has", "have", "had", "was", "were", "are",
+    "been", "get", "make", "more", "less", "per", "as", "if", "not", "no",
+    "its", "his", "her", "their", "our", "above", "below", "between",
+}
+
+
+def _keywords(question):
+    words = question.lower().replace("?", "").replace(",", "").split()
+    return " ".join(w for w in words if w not in _STOP_WORDS and len(w) > 2)[:100]
+
+
+def fetch_news(question):
+    query = _keywords(question)
+    if not query:
+        return []
+
+    now = datetime.now()
+    cached = _news_cache.get(query)
+    if cached and (now - cached["fetched_at"]).total_seconds() < _NEWS_TTL:
+        return cached["articles"]
+
+    try:
+        url = (
+            "https://news.google.com/rss/search"
+            f"?q={requests.utils.quote(query)}&hl=en-US&gl=US&ceid=US:en"
+        )
+        res = requests.get(url, timeout=5)
+        root = ET.fromstring(res.text)
+        articles = []
+        for item in root.findall(".//item")[:5]:
+            title = item.findtext("title", "")
+            pub_date = item.findtext("pubDate", "")
+            try:
+                pub_dt = parsedate_to_datetime(pub_date).replace(tzinfo=None)
+                age_min = int((now - pub_dt).total_seconds() // 60)
+            except Exception:
+                age_min = 9999
+            articles.append({"title": title, "age_min": age_min})
+        _news_cache[query] = {"articles": articles, "fetched_at": now}
+        return articles
+    except Exception:
+        return []
+
+
+def check_news(question):
+    """Return (headline, age_minutes) for the most recent article, or (None, None)."""
+    articles = fetch_news(question)
+    recent = [a for a in articles if a["age_min"] < 120]
+    if not recent:
+        return None, None
+    best = min(recent, key=lambda a: a["age_min"])
+    return best["title"], best["age_min"]
+
+
 def find_opportunities():
     results = []
 
@@ -177,6 +239,15 @@ def find_opportunities():
             score_yes += 1
             reasons_yes.append(f"Tight spread ({spread:.3f})")
 
+        news_headline, news_age = check_news(question)
+        if news_headline:
+            if news_age < 30:
+                score_yes += 3
+                reasons_yes.append(f"Breaking news ({news_age}min ago)")
+            else:
+                score_yes += 1
+                reasons_yes.append(f"Recent news ({news_age}min ago)")
+
         if score_yes >= 3:
             results.append({
                 "token_id": token_id,
@@ -189,6 +260,8 @@ def find_opportunities():
                 "score": score_yes,
                 "reasons": reasons_yes,
                 "side": "YES",
+                "news": news_headline,
+                "news_age": news_age,
             })
 
         # --- NO signal ---
@@ -218,6 +291,14 @@ def find_opportunities():
                 score_no += 1
                 reasons_no.append(f"Tight spread ({spread:.3f})")
 
+            if news_headline:
+                if news_age < 30:
+                    score_no += 3
+                    reasons_no.append(f"Breaking news ({news_age}min ago)")
+                else:
+                    score_no += 1
+                    reasons_no.append(f"Recent news ({news_age}min ago)")
+
             if score_no >= 3 and no_token_id:
                 results.append({
                     "token_id": no_token_id,
@@ -230,6 +311,8 @@ def find_opportunities():
                     "score": score_no,
                     "reasons": reasons_no,
                     "side": "NO",
+                    "news": news_headline,
+                    "news_age": news_age,
                 })
 
     return sorted(results, key=lambda x: x["score"], reverse=True)
@@ -318,6 +401,8 @@ def run_bot():
                     print(f"\n  [{op['score']}pts] [{side}] {op['question'][:60]}")
                     print(f"  Price: {price:.3f} | Volume: ${op['volume']:,.0f} | Drift: {drift_str}")
                     print(f"  Consistency: {op['consistency']:.0%} up | Reasons: {', '.join(op['reasons'])}")
+                    if op.get("news"):
+                        print(f"  NEWS ({op['news_age']}min ago): {op['news'][:80]}")
 
                 best = opportunities[0]
                 if best["score"] >= 4:
