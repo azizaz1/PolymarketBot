@@ -33,12 +33,19 @@ active_positions = {}
 
 
 def get_markets():
-    res = requests.get(
-        "https://gamma-api.polymarket.com/markets"
-        "?active=true&limit=100&order=volumeClob&ascending=false&acceptingOrders=true"
-    )
-    res.raise_for_status()
-    return res.json()
+    markets = []
+    for offset in range(0, 500, 100):
+        res = requests.get(
+            "https://gamma-api.polymarket.com/markets"
+            f"?active=true&limit=100&offset={offset}&enableOrderBook=true"
+            "&order=volumeClob&ascending=false"
+        )
+        res.raise_for_status()
+        page = res.json()
+        markets.extend(page)
+        if len(page) < 100:
+            break
+    return markets
 
 
 def get_orderbook(token_id):
